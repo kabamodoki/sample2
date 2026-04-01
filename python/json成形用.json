@@ -1,0 +1,30 @@
+{
+    "status": "success",
+    "match_count": 3,
+    "hit_word_types": 3,
+    "hit_statistics": [
+        {
+            "keyword": "生年月日",
+            "matched_documents": [
+                "生年月日は「yyyy mm dd」と入力できる形式です"
+            ]
+        },
+        {
+            "keyword": "申請フォーム",
+            "matched_documents": [
+                "申請フォームは企業の入力情報が必要です"
+            ]
+        },
+        {
+            "keyword": "氏名",
+            "matched_documents": [
+                "氏名の形式は「山田 太郎」と空白を入力できる形式です"
+            ]
+        }
+    ],
+    "sent_context": [
+        "生年月日は「yyyy mm dd」と入力できる形式です",
+        "申請フォームは企業の入力情報が必要です",
+        "氏名の形式は「山田 太郎」と空白を入力できる形式です"
+    ]
+}
