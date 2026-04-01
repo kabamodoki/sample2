@@ -1,0 +1,2 @@
+chcp 65001
+curl -X POST "http://localhost:8000/rag-debug" -H "Content-Type: application/json" -d "{\"prompt\":\"氏名と生年月日\"}"
