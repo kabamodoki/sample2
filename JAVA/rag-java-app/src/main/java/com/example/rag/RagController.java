@@ -1,11 +1,11 @@
 package com.example.rag;
 
 import java.io.BufferedReader;
+import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -31,6 +31,7 @@ import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
+import org.apache.tika.Tika;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -40,167 +41,207 @@ import org.springframework.web.bind.annotation.RestController;
 import jakarta.annotation.PostConstruct;
 
 /**
- * ハイブリッドRAG検索コントローラー
- * 従来のキーワード検索（Lucene）と意味ベースのベクトル検索（HNSW）を組み合わせた検索基盤を提供します。
+ * Jグランツ操作マニュアル特化型 RAG検索コントローラー
+ * 16次元ベクトル検索とキーワード検索を組み合わせ、コンソールに詳細ログを出力します。
  */
 @RestController
 @RequestMapping("/rag-debug")
 public class RagController {
 
-    // メモリ上にインデックスを保持するディレクトリ
     private final Directory index = new ByteBuffersDirectory();
-    // 日本語の形態素解析器（Kuromoji）
     private final JapaneseAnalyzer analyzer = new JapaneseAnalyzer();
-    
-    // ベクトルの次元数（PoC用に8つの業務概念を定義）
-    private static final int VECTOR_DIM = 8; 
+    private final Tika tika = new Tika();
 
-    /**
-     * アプリケーション起動時の初期化処理。
-     * リソースファイルの読み込みとインデックス構築を開始します。
-     */
+    // Jグランツの業務フローに最適化した16次元定義
+    private static final int VECTOR_DIM = 16;
+    private static final int MAX_RESULTS = 10;
+    private static final int CHUNK_SIZE = 300;
+
     @PostConstruct
     public void init() throws Exception {
-        loadAndIndexResources();
-    }
-
-    /**
-     * 【仕組み：データインジェクション】
-     * 外部テキストファイル（CSV形式）を読み込み、検索可能な形式に変換して保存します。
-     * カテゴリ（完全一致用）、本文（全文検索用）、ベクトル（意味検索用）の3つの形式で保持します。
-     */
-    private void loadAndIndexResources() throws Exception {
-        ClassPathResource resource = new ClassPathResource("sample_data.txt");
-        
-        try (BufferedReader br = new BufferedReader(new InputStreamReader(resource.getInputStream(), StandardCharsets.UTF_8));
-             IndexWriter writer = new IndexWriter(index, new IndexWriterConfig(analyzer))) {
-            
-            String line;
-            while ((line = br.readLine()) != null) {
-                String[] parts = line.split(",", 2);
-                if (parts.length < 2) continue;
-
-                String category = parts[0].trim();
-                String content = parts[1].trim();
-
-                Document doc = new Document();
-                // カテゴリ：フィルタリングや分類用
-                doc.add(new StringField("category", category, Field.Store.YES));
-                // 本文：キーワードマッチング用（形態素解析される）
-                doc.add(new TextField("content", content, Field.Store.YES));
-                
-                // ベクトル：意味の近さを計算するための数値列（HNSWグラフを構築）
-                float[] vector = mockEmbedding(content); 
-                doc.add(new KnnFloatVectorField("vector", vector, VectorSimilarityFunction.COSINE));
-                
-                writer.addDocument(doc);
-            }
-            System.out.println("--- [SYSTEM] ハイブリッドインデックスの構築完了 ---");
+        try (IndexWriter writer = new IndexWriter(index, new IndexWriterConfig(analyzer))) {
+            loadTextResource(writer, "sample_data.txt");
+            loadPdfResource(writer, "操作マニュアル_事務局管理者用.pdf");
         }
     }
 
     /**
-     * 【仕組み：検索エントリポイント】
-     * クライアントからの質問（プロンプト）を受け取り、ベクトル化、検索、結果の整形を一連の流れで行います。
+     * テキストリソースのインデックス登録
+     */
+    private void loadTextResource(IndexWriter writer, String fileName) throws IOException {
+        ClassPathResource resource = new ClassPathResource(fileName);
+        if (!resource.exists()) return;
+
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(resource.getInputStream(), StandardCharsets.UTF_8))) {
+            br.lines()
+              .map(line -> line.split(",", 2))
+              .filter(parts -> parts.length >= 2)
+              .forEach(parts -> addDocument(writer, parts[0].trim(), parts[1].trim()));
+            System.out.println("--- [SYSTEM] テキストデータの登録完了 ---");
+        }
+    }
+
+    /**
+     * PDFリソースの解析とチャンク分割登録
+     */
+    private void loadPdfResource(IndexWriter writer, String fileName) throws Exception {
+        ClassPathResource resource = new ClassPathResource(fileName);
+        if (!resource.exists()) {
+            System.err.println("[ERROR] PDF未検出: " + fileName);
+            return;
+        }
+
+        System.out.println("--- [SYSTEM] PDF解析開始: " + fileName + " ---");
+        String fullText = tika.parseToString(resource.getInputStream());
+        List<String> chunks = splitIntoChunks(fullText, CHUNK_SIZE);
+
+        for (String chunk : chunks) {
+            addDocument(writer, "PDFマニュアル", chunk.trim());
+        }
+        System.out.println("--- [SYSTEM] PDF登録完了: " + chunks.size() + " chunks ---");
+    }
+
+    /**
+     * ドキュメントの共通登録処理
+     */
+    private void addDocument(IndexWriter writer, String category, String content) {
+        try {
+            Document doc = new Document();
+            doc.add(new StringField("category", category, Field.Store.YES));
+            doc.add(new TextField("content", content, Field.Store.YES));
+
+            float[] vector = mockEmbedding(content);
+            doc.add(new KnnFloatVectorField("vector", vector, VectorSimilarityFunction.COSINE));
+
+            writer.addDocument(doc);
+        } catch (IOException e) {
+            System.err.println("[ERROR] ドキュメント追加失敗: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 検索実行
      */
     @PostMapping
     public Map<String, Object> search(@RequestBody Map<String, String> request) throws Exception {
         String prompt = request.getOrDefault("prompt", "");
         float[] queryVector = mockEmbedding(prompt);
 
-        System.out.println("\n--- [SEARCH START] ---");
-        System.out.println("[INPUT] プロンプト: " + prompt);
-        System.out.println("[PARAM] 検索ベクトル: " + Arrays.toString(queryVector));
+        System.out.println("\n==================================================");
+        System.out.println(" [SEARCH START]");
+        System.out.println(" プロンプト: " + prompt);
+        System.out.println(" 検索ベクトル: " + Arrays.toString(queryVector));
+        System.out.println("==================================================");
 
         try (IndexReader reader = DirectoryReader.open(index)) {
             IndexSearcher searcher = new IndexSearcher(reader);
+            TopDocs topDocs = searcher.search(buildHybridQuery(prompt, queryVector), MAX_RESULTS);
             
-            // ハイブリッドクエリを生成して実行
-            Query hybridQuery = buildHybridQuery(prompt, queryVector);
-            TopDocs topDocs = searcher.search(hybridQuery, 5);
-
-            return buildResponse(searcher, topDocs);
+            return createResponseAndLog(searcher, topDocs);
         }
     }
 
     /**
-     * 【仕組み：ハイブリッド評価ロジック】
-     * 「意味の近さ（Vector）」と「単語の一致（Keyword）」を合成したクエリを作成します。
-     * これにより、言い換え表現に強いベクトル検索と、固有名詞に強いキーワード検索の利点を両立させます。
+     * ハイブリッドクエリ構築
      */
-    private Query buildHybridQuery(String prompt, float[] queryVector) throws Exception {
-        BooleanQuery.Builder chain = new BooleanQuery.Builder();
-
-        // 1. ベクトル近傍探索（K-Nearest Neighbor）: 意味的に近い上位5件を候補にする
-        KnnFloatVectorQuery knnQuery = new KnnFloatVectorQuery("vector", queryVector, 5);
-        chain.add(new BooleanClause(knnQuery, BooleanClause.Occur.SHOULD));
-
-        // 2. テキストマッチング: 形態素解析後の重要語句が含まれるか評価する（BM25アルゴリズム）
-        String keywordQueryStr = prompt.replaceAll("[とがをに、。フォーム]", " ");
-        QueryParser parser = new QueryParser("content", analyzer);
-        Query keywordQuery = parser.parse(keywordQueryStr);
-        chain.add(new BooleanClause(keywordQuery, BooleanClause.Occur.SHOULD));
-
-        return chain.build();
-    }
-
-    /**
-     * 【仕組み：テキストのベクトル化（Embedding）】
-     * 自然文をAIが理解できる数値列に変換します（PoC用モック）。
-     * 実際の実装では、ここでOpenAI等のAPIを呼び出し、高次元（例：1536次元）のベクトルを取得します。
-     */
-    private float[] mockEmbedding(String text) {
-        float[] v = new float[VECTOR_DIM];
+    private Query buildHybridQuery(String prompt, float[] vector) throws Exception {
+        BooleanQuery.Builder builder = new BooleanQuery.Builder();
         
-        // 特定の業務概念（次元）に対応するキーワードが含まれる場合、その次元の数値を高める
-        if (matches(text, "氏名", "名前", "本人", "性別", "年齢")) v[0] = 0.9f;
-        if (matches(text, "メール", "電話", "アドレス", "連絡")) v[1] = 0.9f;
-        if (matches(text, "住所", "郵便", "居住", "ビル", "番地")) v[2] = 0.9f;
-        if (matches(text, "申請", "承認", "提出", "受理", "戻し")) v[3] = 0.9f;
-        if (matches(text, "金融", "銀行", "口座", "振込", "カード", "クレジット")) v[4] = 0.9f;
-        if (matches(text, "勤務", "出勤", "退勤", "雇用", "社員", "休憩")) v[5] = 0.9f;
-        if (matches(text, "休暇", "有給", "休み", "慶弔")) v[6] = 0.9f;
-        if (matches(text, "交通費", "精算", "ルート", "税金", "源泉", "扶養")) v[7] = 0.9f;
+        // ベクトル検索
+        builder.add(new KnnFloatVectorQuery("vector", vector, MAX_RESULTS), BooleanClause.Occur.SHOULD);
 
-        return v;
-    }
-
-    private boolean matches(String text, String... keywords) {
-        return Arrays.stream(keywords).anyMatch(text::contains);
+        // キーワード検索
+        String cleanQuery = prompt.replaceAll("[とがをに、。フォーム]", " ").trim();
+        if (!cleanQuery.isEmpty()) {
+            QueryParser parser = new QueryParser("content", analyzer);
+            builder.add(parser.parse(cleanQuery), BooleanClause.Occur.SHOULD);
+        }
+        return builder.build();
     }
 
     /**
-     * 【仕組み：レスポンス構築】
-     * Luceneが算出した合算スコアに基づき、上位の結果をAPIレスポンスとして返却します。
-     * ここで返却された text が RAG の文脈（Context）としてLLMに渡されることになります。
+     * 詳細ログ出力とレスポンス構築
      */
-    private Map<String, Object> buildResponse(IndexSearcher searcher, TopDocs topDocs) throws Exception {
-        List<Map<String, Object>> statistics = new ArrayList<>();
+    private Map<String, Object> createResponseAndLog(IndexSearcher searcher, TopDocs topDocs) throws IOException {
         List<String> contexts = new ArrayList<>();
-
-        System.out.println("[RESULT] ヒット件数: " + topDocs.totalHits.value);
+        System.out.println(" ヒット総数: " + topDocs.totalHits.value);
+        System.out.println("--------------------------------------------------");
 
         int rank = 1;
         for (ScoreDoc sd : topDocs.scoreDocs) {
             Document d = searcher.doc(sd.doc);
-            String category = d.get("category");
-            String content = d.get("content");
-            
-            contexts.add("[" + category + "] " + content);
+            String cat = d.get("category");
+            String txt = d.get("content").replace("\n", " ");
 
-            Map<String, Object> stat = new HashMap<>();
-            stat.put("category", category);
-            stat.put("text", content);
-            stat.put("total_score", sd.score);
-            statistics.add(stat);
+            contexts.add("[" + cat + "] " + txt);
             
-            System.out.printf("  順位 %d: [%s] スコア: %.4f / 内容: %s%n", rank++, category, sd.score, content);
+            // コンソールに詳細を全量出力
+            System.out.printf("[%d位] スコア: %.4f | カテゴリ: %s%n", rank++, sd.score, cat);
+            System.out.println("内容: " + txt);
+            System.out.println("--------------------------------------------------");
         }
+        System.out.println(" [SEARCH END]\n");
 
-        Map<String, Object> response = new LinkedHashMap<>();
-        response.put("match_count", topDocs.totalHits.value);
-        response.put("hit_statistics", statistics);
-        response.put("sent_context", contexts);
-        return response;
+        Map<String, Object> res = new LinkedHashMap<>();
+        res.put("match_count", topDocs.totalHits.value);
+        res.put("sent_context", contexts);
+        return res;
+    }
+
+    /**
+     * Jグランツ実務に合わせた重み付け擬似Embedding
+     */
+    private float[] mockEmbedding(String text) {
+        float[] v = new float[VECTOR_DIM];
+
+        // 申請・審査系（重要：重み大 0.8-0.95）
+        v[3] = calc(text, 0.85f, "セットアップ", "募集期間", "締切", "補助金名");
+        v[4] = calc(text, 0.85f, "フロー", "プロセス", "ステップ", "手続き");
+        v[5] = calc(text, 0.80f, "項目", "入力欄", "テンプレート", "必須");
+        v[7] = calc(text, 0.90f, "承認", "決裁", "受付", "審査開始");
+        v[8] = calc(text, 0.95f, "差し戻し", "不備", "修正依頼", "再申請");
+        v[9] = calc(text, 0.95f, "却下", "辞退", "取下げ", "終了");
+
+        // アカウント・通知・データ系（重み中 0.5-0.65）
+        v[0] = calc(text, 0.50f, "gBizID", "二要素", "パスワード", "ログイン", "認証");
+        v[1] = calc(text, 0.60f, "権限", "付与", "事務局管理者", "担当者", "アカウント");
+        v[2] = calc(text, 0.60f, "制度", "予算", "公募", "詳細情報");
+        v[6] = calc(text, 0.60f, "添付", "ファイル", "PDF", "JPG", "容量");
+        v[10] = calc(text, 0.60f, "通知", "メール", "自動送信", "文面");
+        v[11] = calc(text, 0.65f, "CSV", "ダウンロード", "抽出", "ZIP");
+        v[13] = calc(text, 0.50f, "事業者画面", "表示", "プレビュー", "マイページ");
+        v[14] = calc(text, 0.60f, "採択", "交付決定", "確定", "実施報告");
+
+        // ヘルプ・環境系（重み低 0.25-0.3）
+        v[12] = calc(text, 0.30f, "ヘルプデスク", "問合せ", "トラブル", "FAQ");
+        v[15] = calc(text, 0.25f, "メンテナンス", "ブラウザ", "OS", "環境");
+
+        return v;
+    }
+
+    private float calc(String text, float weight, String... keys) {
+        float score = 0.0f;
+        for (String key : keys) {
+            if (text.contains(key)) score += weight;
+        }
+        return Math.min(score, 1.0f);
+    }
+
+    /**
+     * チャンク分割
+     */
+    private List<String> splitIntoChunks(String text, int max) {
+        String clean = text.replaceAll("(?m)^[ \t]*\r?\n", "\n").replaceAll("\n+", "\n");
+        List<String> chunks = new ArrayList<>();
+        StringBuilder sb = new StringBuilder();
+        for (String line : clean.split("\n")) {
+            if (sb.length() + line.length() > max) {
+                chunks.add(sb.toString().trim());
+                sb.setLength(0);
+            }
+            sb.append(line).append(" ");
+        }
+        if (sb.length() > 0) chunks.add(sb.toString().trim());
+        return chunks;
     }
 }
