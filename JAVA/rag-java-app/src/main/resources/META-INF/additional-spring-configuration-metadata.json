@@ -1,0 +1,12 @@
+{"properties": [
+  {
+    "name": "llm.api.endpoint",
+    "type": "java.lang.String",
+    "description": "A description for 'llm.api.endpoint'"
+  },
+  {
+    "name": "app.mode",
+    "type": "java.lang.String",
+    "description": "A description for 'app.mode'"
+  }
+]}
